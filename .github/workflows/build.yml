@@ -1,0 +1,61 @@
+name: Build Bear-Net for-web image
+
+# Builds the upstream Stoat web client (stoatchat/for-web) at a pinned commit,
+# with real notification sounds generated over the silent fallback placeholders,
+# and pushes the image to ghcr.io/<owner>/for-web-bearnet.
+#
+# Manual trigger only. This repo never modifies upstream, the for-desktop fork,
+# or the server; the server opts in by pointing compose.yml at the pushed tag.
+# Rollback = point compose.yml back at the previous image tag.
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "stoatchat/for-web commit SHA (full) or tag to build"
+        required: true
+        default: "4b18d9e77790cef725111aa8cd5aaad63aba1b52"
+      image_tag:
+        description: "Tag for the pushed image"
+        required: true
+        default: "4b18d9e-sounds1"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repo (sound generator)
+        uses: actions/checkout@v4
+        with:
+          path: overlay
+
+      - name: Checkout upstream for-web
+        uses: actions/checkout@v4
+        with:
+          repository: stoatchat/for-web
+          ref: ${{ inputs.upstream_ref }}
+          submodules: recursive
+          path: for-web
+
+      - name: Generate notification sounds over fallback placeholders
+        run: |
+          pip install numpy
+          python3 overlay/make_sounds.py for-web/packages/client/scripts/assets_fallback/sounds
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: for-web
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/for-web-bearnet:${{ inputs.image_tag }}
