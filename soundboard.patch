@@ -1,0 +1,544 @@
+diff --git a/packages/client/components/rtc/Soundboard.tsx b/packages/client/components/rtc/Soundboard.tsx
+new file mode 100644
+index 00000000..276261a2
+--- /dev/null
++++ b/packages/client/components/rtc/Soundboard.tsx
+@@ -0,0 +1,194 @@
++import type { Room } from "livekit-client";
++import { createEffect, createSignal, onCleanup } from "solid-js";
++
++import { useClient } from "@revolt/client";
++
++import { useVoice } from "./state";
++
++/** LiveKit data-channel topic used for soundboard triggers */
++export const SOUNDBOARD_TOPIC = "soundboard";
++
++/** Auth header tuple as provided by client.authenticationHeader */
++type Auth = [string, string];
++
++/** One soundboard entry as returned by the soundboard service */
++export type SoundboardSound = {
++  id: string;
++  label: string;
++  builtin: boolean;
++  canDelete: boolean;
++};
++
++const [soundboardOpen, setSoundboardOpen] = createSignal(false);
++const [soundboardSounds, setSoundboardSounds] = createSignal<
++  SoundboardSound[]
++>([]);
++const [soundboardError, setSoundboardError] = createSignal<string>();
++
++function loadVolume(): number {
++  try {
++    const v = parseFloat(localStorage.getItem("soundboard:volume") ?? "");
++    if (Number.isFinite(v) && v >= 0 && v <= 1) return v;
++  } catch {
++    /* ignore */
++  }
++  return 0.6;
++}
++
++const [soundboardVolume, setSoundboardVolumeRaw] = createSignal(loadVolume());
++const [soundboardMuted, setSoundboardMuted] = createSignal(false);
++
++function setSoundboardVolume(v: number) {
++  setSoundboardVolumeRaw(v);
++  try {
++    localStorage.setItem("soundboard:volume", String(v));
++  } catch {
++    /* ignore */
++  }
++}
++
++export {
++  soundboardOpen,
++  setSoundboardOpen,
++  soundboardSounds,
++  soundboardError,
++  setSoundboardError,
++  soundboardVolume,
++  setSoundboardVolume,
++  soundboardMuted,
++  setSoundboardMuted,
++};
++
++/** Cache of sound id -> object URL so each clip is fetched once */
++const urlCache = new Map<string, string>();
++
++async function soundUrl(id: string, auth: Auth): Promise<string> {
++  const cached = urlCache.get(id);
++  if (cached) return cached;
++  const [header, value] = auth;
++  const res = await fetch(`/soundboard/files/${encodeURIComponent(id)}`, {
++    headers: { [header]: value },
++  });
++  if (!res.ok) throw new Error(`soundboard file ${id}: ${res.status}`);
++  const url = URL.createObjectURL(await res.blob());
++  urlCache.set(id, url);
++  return url;
++}
++
++/** Play a soundboard clip locally (respects local volume / mute) */
++export async function playSoundboardSound(id: string, auth: Auth) {
++  if (soundboardMuted()) return;
++  try {
++    const audio = new Audio(await soundUrl(id, auth));
++    audio.volume = soundboardVolume();
++    void audio.play();
++  } catch {
++    /* clip unavailable; stay silent */
++  }
++}
++
++/** Broadcast a trigger to everyone in the call, and play it locally too */
++export function triggerSoundboardSound(
++  room: Room | undefined,
++  auth: Auth,
++  id: string,
++) {
++  try {
++    room?.localParticipant.publishData(
++      new TextEncoder().encode(JSON.stringify({ id })),
++      { reliable: true, topic: SOUNDBOARD_TOPIC },
++    );
++  } catch {
++    /* still play locally below */
++  }
++  void playSoundboardSound(id, auth);
++}
++
++/** Refresh the pad list from the soundboard service */
++export async function refreshSoundboard(auth: Auth) {
++  try {
++    const [header, value] = auth;
++    const res = await fetch("/soundboard/list", {
++      headers: { [header]: value },
++    });
++    if (!res.ok) throw new Error(String(res.status));
++    setSoundboardSounds((await res.json()) as SoundboardSound[]);
++    setSoundboardError(undefined);
++  } catch {
++    setSoundboardError("Soundboard unavailable");
++  }
++}
++
++/** Upload a clip; server enforces the 10 second / 2 MB limits */
++export async function uploadSoundboardSound(auth: Auth, file: File) {
++  const [header, value] = auth;
++  const body = new FormData();
++  body.append("file", file);
++  const res = await fetch("/soundboard/upload", {
++    method: "POST",
++    headers: { [header]: value },
++    body,
++  });
++  if (!res.ok) {
++    let message = "Upload failed";
++    try {
++      message = ((await res.json()) as { error?: string }).error ?? message;
++    } catch {
++      /* keep default */
++    }
++    throw new Error(message);
++  }
++  await refreshSoundboard(auth);
++}
++
++/** Delete a clip (server allows uploader or admin only) */
++export async function deleteSoundboardSound(auth: Auth, id: string) {
++  const [header, value] = auth;
++  await fetch(`/soundboard/sounds/${encodeURIComponent(id)}`, {
++    method: "DELETE",
++    headers: { [header]: value },
++  });
++  await refreshSoundboard(auth);
++}
++
++/**
++ * Mounted inside the voice context while in a room; listens for soundboard
++ * triggers from other participants and plays them locally.
++ */
++export function SoundboardManager() {
++  const voice = useVoice();
++  const client = useClient();
++
++  createEffect(() => {
++    const room = voice.room();
++    if (!room) return;
++
++    const handler = (
++      payload: Uint8Array,
++      _participant?: unknown,
++      _kind?: unknown,
++      topic?: string,
++    ) => {
++      if (topic !== SOUNDBOARD_TOPIC) return;
++      try {
++        const message = JSON.parse(new TextDecoder().decode(payload)) as {
++          id?: string;
++        };
++        if (message?.id)
++          void playSoundboardSound(
++            String(message.id),
++            client()!.authenticationHeader as Auth,
++          );
++      } catch {
++        /* malformed message; ignore */
++      }
++    };
++
++    room.on("dataReceived", handler);
++    onCleanup(() => {
++      room.off("dataReceived", handler);
++    });
++  });
++
++  return null;
++}
+diff --git a/packages/client/components/rtc/state.tsx b/packages/client/components/rtc/state.tsx
+index d3c5c4bc..61d90f1e 100644
+--- a/packages/client/components/rtc/state.tsx
++++ b/packages/client/components/rtc/state.tsx
+@@ -37,6 +37,7 @@ import {
+ import { VoiceCallCardContext } from "@revolt/ui/components/features/voice/callCard/VoiceCallCard";
+ 
+ import { Device, useDevice } from "@revolt/common";
++import { SoundboardManager } from "./Soundboard";
+ import { InRoom } from "./components/InRoom";
+ import { RoomAudioManager } from "./components/RoomAudioManager";
+ import { VoiceProcessor } from "./VoiceProcessor";
+@@ -719,6 +720,7 @@ export function VoiceContext(props: { children: JSX.Element }) {
+         <VoiceCallCardContext>{props.children}</VoiceCallCardContext>
+         <InRoom>
+           <RoomAudioManager />
++          <SoundboardManager />
+         </InRoom>
+       </RoomContext.Provider>
+     </voiceContext.Provider>
+diff --git a/packages/client/components/ui/components/features/voice/callCard/VoiceCallCardActions.tsx b/packages/client/components/ui/components/features/voice/callCard/VoiceCallCardActions.tsx
+index 619d5e5f..270485f4 100644
+--- a/packages/client/components/ui/components/features/voice/callCard/VoiceCallCardActions.tsx
++++ b/packages/client/components/ui/components/features/voice/callCard/VoiceCallCardActions.tsx
+@@ -6,6 +6,7 @@ import { styled } from "styled-system/jsx";
+ 
+ import { useInstance } from "@revolt/instance";
+ import { useVoice } from "@revolt/rtc";
++import { setSoundboardOpen, soundboardOpen } from "@revolt/rtc/Soundboard";
+ import { useState } from "@revolt/state";
+ import { Button, IconButton } from "@revolt/ui/components/design";
+ import { Symbol } from "@revolt/ui/components/utils/Symbol";
+@@ -140,6 +141,19 @@ export function VoiceCallCardActions(props: { size: "xs" | "sm" }) {
+           <Symbol>screen_share</Symbol>
+         </Show>
+       </IconButton>
++      <IconButton
++        size={props.size}
++        variant={soundboardOpen() ? "filled" : "tonal"}
++        onPress={() => setSoundboardOpen(!soundboardOpen())}
++        use:floating={{
++          tooltip: {
++            placement: "top",
++            content: soundboardOpen() ? t`Hide soundboard` : t`Soundboard`,
++          },
++        }}
++      >
++        <Symbol>music_note</Symbol>
++      </IconButton>
+       <Button
+         size={props.size}
+         variant="_error"
+diff --git a/packages/client/components/ui/components/features/voice/callCard/VoiceCallCardActiveRoom.tsx b/packages/client/components/ui/components/features/voice/callCard/VoiceCallCardActiveRoom.tsx
+index b6fb1c04..bae6e315 100644
+--- a/packages/client/components/ui/components/features/voice/callCard/VoiceCallCardActiveRoom.tsx
++++ b/packages/client/components/ui/components/features/voice/callCard/VoiceCallCardActiveRoom.tsx
+@@ -10,8 +10,11 @@ import { IconButton } from "@revolt/ui/components/design";
+ import { Symbol } from "@revolt/ui/components/utils/Symbol";
+ import { scrollableStyles } from "@revolt/ui/directives";
+ 
++import { soundboardOpen } from "@revolt/rtc/Soundboard";
++
+ import { ParticipantTile, tile } from "./ParticipantTile";
+ import { VoiceCallCardActions } from "./VoiceCallCardActions";
++import { VoiceCallCardSoundboard } from "./VoiceCallCardSoundboard";
+ import { VoiceCallCardStatus } from "./VoiceCallCardStatus";
+ 
+ /**
+@@ -24,6 +27,9 @@ export function VoiceCallCardActiveRoom() {
+   return (
+     <View collapsed={collapsed()}>
+       <Participants />
++      <Show when={soundboardOpen() && !collapsed()}>
++        <VoiceCallCardSoundboard />
++      </Show>
+       <VoiceCallControls>
+         <VoiceCallControlHolder left collapsed={collapsed()}>
+           <VoiceCallCardStatus />
+diff --git a/packages/client/components/ui/components/features/voice/callCard/VoiceCallCardSoundboard.tsx b/packages/client/components/ui/components/features/voice/callCard/VoiceCallCardSoundboard.tsx
+new file mode 100644
+index 00000000..44c4c1dd
+--- /dev/null
++++ b/packages/client/components/ui/components/features/voice/callCard/VoiceCallCardSoundboard.tsx
+@@ -0,0 +1,260 @@
++import { For, Show, createSignal, onMount } from "solid-js";
++
++import { useLingui } from "@lingui/solid/macro";
++import { styled } from "styled-system/jsx";
++
++import { useClient } from "@revolt/client";
++import { useVoice } from "@revolt/rtc";
++import {
++  deleteSoundboardSound,
++  refreshSoundboard,
++  setSoundboardMuted,
++  setSoundboardVolume,
++  soundboardError,
++  soundboardMuted,
++  soundboardSounds,
++  soundboardVolume,
++  triggerSoundboardSound,
++  uploadSoundboardSound,
++} from "@revolt/rtc/Soundboard";
++import { IconButton } from "@revolt/ui/components/design";
++import { Symbol } from "@revolt/ui/components/utils/Symbol";
++
++/**
++ * Soundboard panel shown inside the call card
++ */
++export function VoiceCallCardSoundboard() {
++  const voice = useVoice();
++  const client = useClient();
++  const { t } = useLingui();
++
++  const auth = () => client()!.authenticationHeader as [string, string];
++
++  const [busy, setBusy] = createSignal(false);
++  const [message, setMessage] = createSignal<string>();
++
++  let fileInput: HTMLInputElement | undefined;
++
++  onMount(() => void refreshSoundboard(auth()));
++
++  async function onFilePicked() {
++    const file = fileInput?.files?.[0];
++    if (!file) return;
++    setBusy(true);
++    setMessage(undefined);
++    try {
++      await uploadSoundboardSound(auth(), file);
++    } catch (err) {
++      setMessage(err instanceof Error ? err.message : "Upload failed");
++    } finally {
++      setBusy(false);
++      if (fileInput) fileInput.value = "";
++    }
++  }
++
++  return (
++    <Panel>
++      <Header>
++        <Title>{t`Soundboard`}</Title>
++        <Controls>
++          <VolumeSlider
++            type="range"
++            min="0"
++            max="100"
++            value={Math.round(soundboardVolume() * 100)}
++            onInput={(e) =>
++              setSoundboardVolume(parseInt(e.currentTarget.value, 10) / 100)
++            }
++          />
++          <IconButton
++            size="xs"
++            variant={soundboardMuted() ? "filled" : "standard"}
++            onPress={() => setSoundboardMuted(!soundboardMuted())}
++            use:floating={{
++              tooltip: {
++                placement: "top",
++                content: soundboardMuted()
++                  ? t`Unmute soundboard (only for you)`
++                  : t`Mute soundboard (only for you)`,
++              },
++            }}
++          >
++            <Symbol>
++              {soundboardMuted() ? "volume_off" : "volume_up"}
++            </Symbol>
++          </IconButton>
++        </Controls>
++      </Header>
++      <Show when={soundboardError() || message()}>
++        <Message>{soundboardError() ?? message()}</Message>
++      </Show>
++      <Pads>
++        <For each={soundboardSounds()}>
++          {(sound) => (
++            <Pad
++              onClick={() =>
++                triggerSoundboardSound(voice.room(), auth(), sound.id)
++              }
++            >
++              <PadLabel>{sound.label}</PadLabel>
++              <Show when={sound.canDelete}>
++                <DeleteButton
++                  onClick={(e) => {
++                    e.stopPropagation();
++                    void deleteSoundboardSound(auth(), sound.id);
++                  }}
++                >
++                  <Symbol>close</Symbol>
++                </DeleteButton>
++              </Show>
++            </Pad>
++          )}
++        </For>
++        <UploadPad
++          onClick={() => !busy() && fileInput?.click()}
++          disabled={busy()}
++        >
++          <Symbol>add</Symbol>
++          <PadLabel>{busy() ? t`Uploading…` : t`Upload · 10s max`}</PadLabel>
++        </UploadPad>
++      </Pads>
++      <input
++        ref={fileInput}
++        type="file"
++        accept="audio/*,.mp3,.ogg,.wav,.m4a"
++        style={{ display: "none" }}
++        onChange={() => void onFilePicked()}
++      />
++    </Panel>
++  );
++}
++
++const Panel = styled("div", {
++  base: {
++    flexShrink: 0,
++    maxHeight: "45%",
++    display: "flex",
++    flexDirection: "column",
++    gap: "var(--gap-sm)",
++    padding: "var(--gap-md)",
++    borderRadius: "var(--borderRadius-lg)",
++    background: "var(--md-sys-color-surface-container)",
++    overflowY: "auto",
++  },
++});
++
++const Header = styled("div", {
++  base: {
++    display: "flex",
++    alignItems: "center",
++    justifyContent: "space-between",
++    gap: "var(--gap-md)",
++  },
++});
++
++const Title = styled("span", {
++  base: {
++    fontSize: "0.8rem",
++    fontWeight: 600,
++    textTransform: "uppercase",
++    letterSpacing: "0.08em",
++    color: "var(--md-sys-color-on-surface-variant)",
++  },
++});
++
++const Controls = styled("div", {
++  base: {
++    display: "flex",
++    alignItems: "center",
++    gap: "var(--gap-sm)",
++  },
++});
++
++const VolumeSlider = styled("input", {
++  base: {
++    width: "90px",
++    accentColor: "var(--md-sys-color-primary)",
++  },
++});
++
++const Message = styled("div", {
++  base: {
++    fontSize: "0.8rem",
++    color: "var(--md-sys-color-error)",
++  },
++});
++
++const Pads = styled("div", {
++  base: {
++    display: "grid",
++    gridTemplateColumns: "repeat(auto-fill, minmax(96px, 1fr))",
++    gap: "var(--gap-sm)",
++  },
++});
++
++const Pad = styled("button", {
++  base: {
++    position: "relative",
++    display: "flex",
++    flexDirection: "column",
++    alignItems: "center",
++    justifyContent: "center",
++    gap: "var(--gap-xs)",
++    padding: "var(--gap-md) var(--gap-sm)",
++    borderRadius: "var(--borderRadius-md)",
++    background: "var(--md-sys-color-surface-container-high)",
++    color: "var(--md-sys-color-on-surface)",
++    cursor: "pointer",
++    border: "none",
++    transition: "background var(--transitions-fast)",
++    _hover: {
++      background: "var(--md-sys-color-surface-container-highest)",
++    },
++    _active: {
++      transform: "translateY(1px)",
++    },
++  },
++});
++
++const UploadPad = styled("button", {
++  base: {
++    display: "flex",
++    flexDirection: "column",
++    alignItems: "center",
++    justifyContent: "center",
++    gap: "var(--gap-xs)",
++    padding: "var(--gap-md) var(--gap-sm)",
++    borderRadius: "var(--borderRadius-md)",
++    background: "transparent",
++    color: "var(--md-sys-color-on-surface-variant)",
++    cursor: "pointer",
++    border: "1px dashed var(--md-sys-color-outline)",
++  },
++});
++
++const PadLabel = styled("span", {
++  base: {
++    fontSize: "0.72rem",
++    maxWidth: "100%",
++    overflow: "hidden",
++    textOverflow: "ellipsis",
++    whiteSpace: "nowrap",
++  },
++});
++
++const DeleteButton = styled("span", {
++  base: {
++    position: "absolute",
++    top: "2px",
++    insetInlineEnd: "2px",
++    display: "flex",
++    borderRadius: "var(--borderRadius-full)",
++    color: "var(--md-sys-color-on-surface-variant)",
++    opacity: 0.6,
++    fontSize: "0.7rem",
++    _hover: {
++      opacity: 1,
++      color: "var(--md-sys-color-error)",
++    },
++  },
++});
