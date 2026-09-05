@@ -43,6 +43,8 @@ jobs:
 
       - name: Generate notification sounds over fallback placeholders
         run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q ffmpeg
           pip install numpy
           python3 overlay/make_sounds.py for-web/packages/client/scripts/assets_fallback/sounds
 
