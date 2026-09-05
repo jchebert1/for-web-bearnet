@@ -1,11 +1,15 @@
 name: Build Bear-Net for-web image
 
 # Builds the upstream Stoat web client (stoatchat/for-web) at a pinned commit,
-# with real notification sounds generated over the silent fallback placeholders,
-# and pushes the image to ghcr.io/<owner>/for-web-bearnet.
+# with Bear-Net extras applied on top:
+#   - real notification sounds generated over the silent fallback placeholders
+#   - the soundboard patch (call-card panel + LiveKit data-channel triggers)
+# and pushes two images:
+#   ghcr.io/<owner>/for-web-bearnet:<image_tag>      (the web client)
+#   ghcr.io/<owner>/soundboard-bearnet:<image_tag>   (the upload service)
 #
 # Manual trigger only. This repo never modifies upstream, the for-desktop fork,
-# or the server; the server opts in by pointing compose.yml at the pushed tag.
+# or the server; the server opts in by pointing compose.yml at the pushed tags.
 # Rollback = point compose.yml back at the previous image tag.
 
 on:
@@ -16,9 +20,9 @@ on:
         required: true
         default: "4b18d9e77790cef725111aa8cd5aaad63aba1b52"
       image_tag:
-        description: "Tag for the pushed image"
+        description: "Tag for the pushed images"
         required: true
-        default: "4b18d9e-sounds1"
+        default: "4b18d9e-soundboard1"
 
 permissions:
   contents: read
@@ -28,7 +32,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout this repo (sound generator)
+      - name: Checkout this repo (Bear-Net extras)
         uses: actions/checkout@v4
         with:
           path: overlay
@@ -41,12 +45,20 @@ jobs:
           submodules: recursive
           path: for-web
 
-      - name: Generate notification sounds over fallback placeholders
+      - name: Install audio tooling
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q ffmpeg
           pip install numpy
-          python3 overlay/make_sounds.py for-web/packages/client/scripts/assets_fallback/sounds
+
+      - name: Generate notification sounds over fallback placeholders
+        run: python3 overlay/make_sounds.py for-web/packages/client/scripts/assets_fallback/sounds
+
+      - name: Apply soundboard patch
+        run: git -C for-web apply --stat --apply ../overlay/soundboard.patch
+
+      - name: Generate built-in soundboard effects
+        run: python3 overlay/make_effects.py overlay/service/builtin
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -55,9 +67,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push image
+      - name: Build and push web client image
         uses: docker/build-push-action@v6
         with:
           context: for-web
           push: true
           tags: ghcr.io/${{ github.repository_owner }}/for-web-bearnet:${{ inputs.image_tag }}
+
+      - name: Build and push soundboard service image
+        uses: docker/build-push-action@v6
+        with:
+          context: overlay/service
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/soundboard-bearnet:${{ inputs.image_tag }}
