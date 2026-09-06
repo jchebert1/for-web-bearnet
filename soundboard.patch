@@ -1,9 +1,9 @@
 diff --git a/packages/client/components/rtc/Soundboard.tsx b/packages/client/components/rtc/Soundboard.tsx
 new file mode 100644
-index 00000000..276261a2
+index 00000000..05b79793
 --- /dev/null
 +++ b/packages/client/components/rtc/Soundboard.tsx
-@@ -0,0 +1,194 @@
+@@ -0,0 +1,207 @@
 +import type { Room } from "livekit-client";
 +import { createEffect, createSignal, onCleanup } from "solid-js";
 +
@@ -93,19 +93,29 @@ index 00000000..276261a2
 +  }
 +}
 +
-+/** Broadcast a trigger to everyone in the call, and play it locally too */
++/**
++ * Broadcast a trigger to everyone in the call, and play it locally too.
++ *
++ * The broadcast goes through the soundboard service, which injects the
++ * message into the LiveKit room server-side. (Participant tokens issued by
++ * the backend have can_publish_data: false, so a direct client publishData
++ * is silently dropped by the voice server.)
++ */
 +export function triggerSoundboardSound(
 +  room: Room | undefined,
 +  auth: Auth,
 +  id: string,
 +) {
-+  try {
-+    room?.localParticipant.publishData(
-+      new TextEncoder().encode(JSON.stringify({ id })),
-+      { reliable: true, topic: SOUNDBOARD_TOPIC },
-+    );
-+  } catch {
-+    /* still play locally below */
++  const roomName = room?.name;
++  if (roomName) {
++    const [header, value] = auth;
++    void fetch("/soundboard/play", {
++      method: "POST",
++      headers: { [header]: value, "content-type": "application/json" },
++      body: JSON.stringify({ room: roomName, id }),
++    }).catch(() => {
++      /* broadcast failed; local playback below still happens */
++    });
 +  }
 +  void playSoundboardSound(id, auth);
 +}
@@ -179,7 +189,10 @@ index 00000000..276261a2
 +      try {
 +        const message = JSON.parse(new TextDecoder().decode(payload)) as {
 +          id?: string;
++          sender?: string;
 +        };
++        // the sender already played it locally on press; don't echo
++        if (message?.sender && message.sender === client()!.user?.id) return;
 +        if (message?.id)
 +          void playSoundboardSound(
 +            String(message.id),
