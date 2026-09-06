@@ -9,9 +9,13 @@ const { execFileSync } = require("node:child_process");
 
 const express = require("express");
 const multer = require("multer");
+const { RoomServiceClient } = require("livekit-server-sdk");
 
 const PORT = parseInt(process.env.PORT ?? "8600", 10);
 const API_URL = process.env.API_URL ?? "http://api:14702";
+const LIVEKIT_URL = process.env.LIVEKIT_URL ?? "http://livekit:7880";
+const LIVEKIT_KEY = process.env.LIVEKIT_KEY ?? "";
+const LIVEKIT_SECRET = process.env.LIVEKIT_SECRET ?? "";
 const ADMIN_USER_ID = process.env.ADMIN_USER_ID ?? "";
 const DATA_DIR = process.env.DATA_DIR ?? "/data";
 const BUILTIN_DIR = process.env.BUILTIN_DIR ?? "/app/builtin";
@@ -84,6 +88,40 @@ function listBuiltin() {
     return [];
   }
 }
+
+// ---- broadcast a pad press into the LiveKit room (server-side SendData) ----
+// Participant tokens from the Stoat backend carry can_publish_data: false, so
+// clients cannot broadcast on the data channel themselves; this endpoint does
+// it for them with the LiveKit admin key. Receiving needs no permission.
+const roomService =
+  LIVEKIT_KEY && LIVEKIT_SECRET
+    ? new RoomServiceClient(LIVEKIT_URL, LIVEKIT_KEY, LIVEKIT_SECRET)
+    : null;
+
+function soundExists(id) {
+  if (/^b_[a-z0-9_]+$/i.test(id))
+    return fs.existsSync(path.join(BUILTIN_DIR, `${id.slice(2)}.ogg`));
+  return loadMeta().some((s) => s.id === id);
+}
+
+app.post("/play", express.json(), async (req, res) => {
+  if (!roomService)
+    return res.status(503).json({ error: "Soundboard broadcast not configured" });
+  const { room, id } = req.body ?? {};
+  if (typeof room !== "string" || typeof id !== "string" || !soundExists(id))
+    return res.status(400).json({ error: "Bad play request" });
+  try {
+    const payload = new TextEncoder().encode(
+      JSON.stringify({ id, sender: req.user._id }),
+    );
+    await roomService.sendData(room, payload, 0 /* reliable */, {
+      topic: "soundboard",
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(502).json({ error: "Could not reach the call" });
+  }
+});
 
 app.get("/list", (req, res) => {
   const uploads = loadMeta().map((s) => ({
